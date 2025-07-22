@@ -1,33 +1,15 @@
 import logging
-from typing import Annotated
-
-import mlflow
 import pandas as pd
-from sklearn.base import RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from zenml import ArtifactConfig, step
-from zenml.client import Client
-
-# Get the active experiment tracker from ZenML
-experiment_tracker = Client().active_stack.experiment_tracker
-from zenml import Model
-
-model = Model(
-    name="prices_predictor",
-    version=None,
-    license="Apache 2.0",
-    description="Price prediction model for houses.",
-)
+import pickle
+import os
 
 
-@step(enable_cache=False, experiment_tracker=experiment_tracker.name, model=model)
-def model_building_step(
-    X_train: pd.DataFrame, y_train: pd.Series
-) -> Annotated[Pipeline, ArtifactConfig(name="sklearn_pipeline", is_model_artifact=True)]:
+def model_building_step(X_train: pd.DataFrame, y_train: pd.Series) -> Pipeline:
     """
     Builds and trains a Linear Regression model using scikit-learn wrapped in a pipeline.
 
@@ -38,67 +20,73 @@ def model_building_step(
     Returns:
     Pipeline: The trained scikit-learn pipeline including preprocessing and the Linear Regression model.
     """
-    # Ensure the inputs are of the correct type
-    if not isinstance(X_train, pd.DataFrame):
-        raise TypeError("X_train must be a pandas DataFrame.")
-    if not isinstance(y_train, pd.Series):
-        raise TypeError("y_train must be a pandas Series.")
-
-    # Identify categorical and numerical columns
-    categorical_cols = X_train.select_dtypes(include=["object", "category"]).columns
-    numerical_cols = X_train.select_dtypes(exclude=["object", "category"]).columns
-
-    logging.info(f"Categorical columns: {categorical_cols.tolist()}")
-    logging.info(f"Numerical columns: {numerical_cols.tolist()}")
-
-    # Define preprocessing for categorical and numerical features
-    numerical_transformer = SimpleImputer(strategy="mean")
-    categorical_transformer = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]
-    )
-
-    # Bundle preprocessing for numerical and categorical data
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numerical_transformer, numerical_cols),
-            ("cat", categorical_transformer, categorical_cols),
-        ]
-    )
-
-    # Define the model training pipeline
-    pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("model", LinearRegression())])
-
-    # Start an MLflow run to log the model training process
-    if not mlflow.active_run():
-        mlflow.start_run()  # Start a new MLflow run if there isn't one active
-
+    logger = logging.getLogger("model_building_step")
+    logger.info("Starting model building step.")
+    
     try:
-        # Enable autologging for scikit-learn to automatically capture model metrics, parameters, and artifacts
-        mlflow.sklearn.autolog()
+        # Ensure the inputs are of the correct type
+        if not isinstance(X_train, pd.DataFrame):
+            logger.error("X_train must be a pandas DataFrame.")
+            raise TypeError("X_train must be a pandas DataFrame.")
+        if not isinstance(y_train, pd.Series):
+            logger.error("y_train must be a pandas Series.")
+            raise TypeError("y_train must be a pandas Series.")
 
-        logging.info("Building and training the Linear Regression model.")
+        # Identify categorical and numerical columns
+        categorical_cols = X_train.select_dtypes(include=["object", "category"]).columns
+        numerical_cols = X_train.select_dtypes(exclude=["object", "category"]).columns
+
+        logger.info(f"Categorical columns: {categorical_cols.tolist()}")
+        logger.info(f"Numerical columns: {numerical_cols.tolist()}")
+
+        # Define preprocessing for categorical and numerical features
+        numerical_transformer = SimpleImputer(strategy="mean")
+        categorical_transformer = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]
+        )
+
+        # Bundle preprocessing for numerical and categorical data
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("num", numerical_transformer, numerical_cols),
+                ("cat", categorical_transformer, categorical_cols),
+            ]
+        )
+
+        # Define the model training pipeline
+        pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("model", LinearRegression())])
+
+        logger.info("Building and training the Linear Regression model.")
         pipeline.fit(X_train, y_train)
-        logging.info("Model training completed.")
+        logger.info("Model training completed.")
+
+        # Save the model
+        model_dir = "models"
+        os.makedirs(model_dir, exist_ok=True)
+        model_path = os.path.join(model_dir, "prices_predictor.pkl")
+        
+        with open(model_path, 'wb') as f:
+            pickle.dump(pipeline, f)
+        logger.info(f"Model saved to {model_path}")
 
         # Log the columns that the model expects
-        onehot_encoder = (
-            pipeline.named_steps["preprocessor"].transformers_[1][1].named_steps["onehot"]
-        )
-        onehot_encoder.fit(X_train[categorical_cols])
-        expected_columns = numerical_cols.tolist() + list(
-            onehot_encoder.get_feature_names_out(categorical_cols)
-        )
-        logging.info(f"Model expects the following columns: {expected_columns}")
+        if categorical_cols.any():
+            onehot_encoder = (
+                pipeline.named_steps["preprocessor"].transformers_[1][1].named_steps["onehot"]
+            )
+            expected_columns = numerical_cols.tolist() + list(
+                onehot_encoder.get_feature_names_out(categorical_cols)
+            )
+        else:
+            expected_columns = numerical_cols.tolist()
+            
+        logger.info(f"Model expects the following columns: {expected_columns}")
 
+        return pipeline
+        
     except Exception as e:
-        logging.error(f"Error during model training: {e}")
-        raise e
-
-    finally:
-        # End the MLflow run
-        mlflow.end_run()
-
-    return pipeline
+        logger.error(f"Error during model training: {e}")
+        raise
