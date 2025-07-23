@@ -1,234 +1,414 @@
 import os
 import joblib
 import pandas as pd
-from flask import Flask, request, jsonify
-from flask_restx import Api, Resource, fields
+import numpy as np
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict, Any
+import uvicorn
 import threading
 import time
+from datetime import datetime
+import asyncio
 from pipelines.training_pipeline import ml_pipeline
 from steps.dynamic_importer import dynamic_importer
 
 
-class ModelService:
-    """Simple model service to replace MLflow deployment."""
+class HouseFeatures(BaseModel):
+    """Pydantic model for single house prediction request with validation."""
     
-    def __init__(self, model_path):
+    date: str = Field(..., description="Date in YYYY-MM-DD format", example="2014-05-02")
+    bedrooms: int = Field(..., ge=0, le=20, description="Number of bedrooms", example=3)
+    bathrooms: float = Field(..., ge=0, le=10, description="Number of bathrooms", example=2.0)
+    sqft_living: int = Field(..., ge=300, le=20000, description="Square feet of living space", example=1180)
+    sqft_lot: int = Field(..., ge=500, le=200000, description="Square feet of lot", example=5650)
+    floors: float = Field(..., ge=1, le=4, description="Number of floors", example=1.0)
+    waterfront: int = Field(..., ge=0, le=1, description="Waterfront property (0 or 1)", example=0)
+    view: int = Field(..., ge=0, le=4, description="Quality of view (0-4)", example=0)
+    condition: int = Field(..., ge=1, le=5, description="Condition of the house (1-5)", example=3)
+    sqft_above: int = Field(..., ge=0, le=20000, description="Square feet above ground", example=1180)
+    sqft_basement: int = Field(..., ge=0, le=5000, description="Square feet of basement", example=0)
+    yr_built: int = Field(..., ge=1900, le=2025, description="Year built", example=2003)
+    yr_renovated: int = Field(..., ge=0, le=2025, description="Year renovated (0 if never)", example=0)
+    street: str = Field(..., max_length=200, description="Street address", example="Northwest 105th Street")
+    city: str = Field(..., max_length=100, description="City", example="Seattle")
+    statezip: str = Field(..., max_length=20, description="State and ZIP code", example="WA 98105")
+    country: str = Field(..., max_length=50, description="Country", example="USA")
+
+    @validator('date')
+    def validate_date(cls, v):
+        try:
+            datetime.strptime(v, '%Y-%m-%d')
+            return v
+        except ValueError:
+            raise ValueError('Date must be in YYYY-MM-DD format')
+
+    @validator('yr_renovated')
+    def validate_renovation(cls, v, values):
+        if 'yr_built' in values and v > 0 and v < values['yr_built']:
+            raise ValueError('Renovation year cannot be before build year')
+        return v
+
+
+class BatchPredictionRequest(BaseModel):
+    """Model for batch prediction requests."""
+    houses: List[HouseFeatures] = Field(..., description="List of houses to predict")
+
+
+class PredictionResponse(BaseModel):
+    """Response model for predictions."""
+    predictions: List[float] = Field(..., description="Predicted house prices")
+    status: str = Field(..., description="Response status")
+    count: int = Field(..., description="Number of predictions made")
+    model_version: Optional[str] = Field(None, description="Model version used")
+    prediction_timestamp: str = Field(..., description="When predictions were made")
+
+
+class ErrorResponse(BaseModel):
+    """Error response model."""
+    error: str = Field(..., description="Error message")
+    status: str = Field(..., description="Error status")
+    timestamp: str = Field(..., description="Error timestamp")
+
+
+class HealthResponse(BaseModel):
+    """Health check response model."""
+    status: str = Field(..., description="Service health status")
+    model_loaded: bool = Field(..., description="Whether model is loaded")
+    model_path: Optional[str] = Field(None, description="Path to loaded model")
+    uptime_seconds: float = Field(..., description="Service uptime in seconds")
+    timestamp: str = Field(..., description="Current timestamp")
+    memory_usage_mb: Optional[float] = Field(None, description="Memory usage in MB")
+
+
+class ModelService:
+    """Enhanced model service with metadata tracking."""
+    
+    def __init__(self, model_path: str):
         self.model = joblib.load(model_path)
         self.model_path = model_path
+        self.model_version = self._extract_version_from_path(model_path)
+        self.load_timestamp = datetime.now()
+        self.prediction_count = 0
         
-    def predict(self, data):
-        """Make predictions on input data."""
-        if isinstance(data, pd.DataFrame):
-            return self.model.predict(data)
-        else:
-            # Convert to DataFrame if needed
-            df = pd.DataFrame(data)
-            return self.model.predict(df)
-
-
-class SimpleDeploymentService:
-    """Simple deployment service with Swagger documentation."""
+    def _extract_version_from_path(self, path: str) -> str:
+        """Extract version/timestamp from model path."""
+        filename = os.path.basename(path)
+        if '_' in filename:
+            return filename.split('_')[-1].replace('.pkl', '')
+        return "unknown"
     
-    def __init__(self, model_path, port=5000):
+    def predict(self, data: pd.DataFrame) -> np.ndarray:
+        """Make predictions on input data with error handling."""
+        try:
+            predictions = self.model.predict(data)
+            self.prediction_count += len(predictions)
+            return predictions
+        except Exception as e:
+            raise ValueError(f"Prediction failed: {str(e)}")
+    
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get model metadata."""
+        return {
+            "model_path": self.model_path,
+            "model_version": self.model_version,
+            "load_timestamp": self.load_timestamp.isoformat(),
+            "prediction_count": self.prediction_count
+        }
+
+
+class FastAPIDeploymentService:
+    """FastAPI deployment service with comprehensive Swagger documentation."""
+    
+    def __init__(self, model_path: str, port: int = 8000):
         self.model_service = ModelService(model_path)
         self.port = port
-        self.app = Flask(__name__)
+        self.start_time = time.time()
         
-        # Initialize Flask-RESTX
-        self.api = Api(
-            self.app,
-            version='1.0',
-            title='House Price Prediction API',
-            description='API for house price predictions using machine learning',
-            doc='/swagger/',  # Swagger UI will be available at /swagger/
-            prefix='/api/v1'
+        # Initialize FastAPI app
+        self.app = FastAPI(
+            title="House Price Prediction API",
+            description="""
+            🏠 **Advanced House Price Prediction API**
+            
+            This API provides machine learning-powered house price predictions using a trained regression model.
+            
+            ## Features
+            - Single house price prediction
+            - Batch predictions for multiple houses
+            - Comprehensive input validation
+            - Health monitoring
+            - Model metadata tracking
+            
+            ## Usage
+            1. Use `/predict` endpoint for single house predictions
+            2. Use `/predict/batch` for multiple house predictions
+            3. Check `/health` for service status
+            
+            ## Data Requirements
+            All house features must be provided including location, size, condition, and temporal information.
+            """,
+            version="2.0.0",
+            docs_url="/docs",  # Swagger UI
+            redoc_url="/redoc",  # ReDoc alternative
         )
         
-        self.setup_models()
+        # Add CORS middleware for web applications
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],  # Configure properly for production
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
         self.setup_routes()
-        self.server_thread = None
     
-    def setup_models(self):
-        """Define Swagger models for request/response serialization."""
-        
-        # Model for single house prediction request
-        self.house_data_model = self.api.model('HouseData', {
-            'date': fields.List(fields.String, required=True, description='Date in YYYY-MM-DD format', example=['2014-05-02']),
-            'bedrooms': fields.List(fields.Integer, required=True, description='Number of bedrooms', example=[3]),
-            'bathrooms': fields.List(fields.Float, required=True, description='Number of bathrooms', example=[2.0]),
-            'sqft_living': fields.List(fields.Integer, required=True, description='Square feet of living space', example=[1180]),
-            'sqft_lot': fields.List(fields.Integer, required=True, description='Square feet of lot', example=[5650]),
-            'floors': fields.List(fields.Float, required=True, description='Number of floors', example=[1.0]),
-            'waterfront': fields.List(fields.Integer, required=True, description='Waterfront property (0 or 1)', example=[0]),
-            'view': fields.List(fields.Integer, required=True, description='Quality of view (0-4)', example=[0]),
-            'condition': fields.List(fields.Integer, required=True, description='Condition of the house (1-5)', example=[3]),
-            'sqft_above': fields.List(fields.Integer, required=True, description='Square feet above ground', example=[1180]),
-            'sqft_basement': fields.List(fields.Integer, required=True, description='Square feet of basement', example=[0]),
-            'yr_built': fields.List(fields.Integer, required=True, description='Year built', example=[2003]),
-            'yr_renovated': fields.List(fields.Integer, required=True, description='Year renovated (0 if never)', example=[0]),
-            'street': fields.List(fields.String, required=True, description='Street address', example=['Northwest 105th Street']),
-            'city': fields.List(fields.String, required=True, description='City', example=['Seattle']),
-            'statezip': fields.List(fields.String, required=True, description='State and ZIP code', example=['WA 98105']),
-            'country': fields.List(fields.String, required=True, description='Country', example=['USA'])
-        })
-        
-        # Model for multiple houses prediction request
-        self.batch_prediction_model = self.api.model('BatchPrediction', {
-            'houses': fields.List(fields.Nested(self.house_data_model), required=True, description='List of houses to predict')
-        })
-        
-        # Response models
-        self.prediction_response_model = self.api.model('PredictionResponse', {
-            'predictions': fields.List(fields.Float, description='Predicted house prices'),
-            'status': fields.String(description='Response status'),
-            'count': fields.Integer(description='Number of predictions made')
-        })
-        
-        self.error_response_model = self.api.model('ErrorResponse', {
-            'error': fields.String(description='Error message'),
-            'status': fields.String(description='Error status')
-        })
-        
-        self.health_response_model = self.api.model('HealthResponse', {
-            'status': fields.String(description='Service health status'),
-            'model_loaded': fields.Boolean(description='Whether model is loaded'),
-            'timestamp': fields.String(description='Current timestamp')
-        })
-        
+    def _convert_house_to_dataframe(self, house: HouseFeatures) -> pd.DataFrame:
+        """Convert HouseFeatures to DataFrame format expected by model."""
+        data = {
+            'date': [house.date],
+            'bedrooms': [house.bedrooms],
+            'bathrooms': [house.bathrooms],
+            'sqft_living': [house.sqft_living],
+            'sqft_lot': [house.sqft_lot],
+            'floors': [house.floors],
+            'waterfront': [house.waterfront],
+            'view': [house.view],
+            'condition': [house.condition],
+            'sqft_above': [house.sqft_above],
+            'sqft_basement': [house.sqft_basement],
+            'yr_built': [house.yr_built],
+            'yr_renovated': [house.yr_renovated],
+            'street': [house.street],
+            'city': [house.city],
+            'statezip': [house.statezip],
+            'country': [house.country]
+        }
+        return pd.DataFrame(data)
+    
     def setup_routes(self):
-        """Setup API routes with Swagger documentation."""
+        """Setup FastAPI routes with comprehensive documentation."""
         
-        ns = self.api.namespace('predictions', description='House price prediction operations')
-        
-        @ns.route('/predict')
-        class Predict(Resource):
-            @ns.expect(self.house_data_model)
-            @ns.marshal_with(self.prediction_response_model, code=200)
-            @ns.marshal_with(self.error_response_model, code=400)
-            def post(self):
-                """Make a single house price prediction"""
-                try:
-                    data = request.get_json()
-                    predictions = self.model_service.predict(data)
-                    
-                    return {
-                        'predictions': predictions.tolist(),
-                        'status': 'success',
-                        'count': len(predictions)
-                    }, 200
-                    
-                except Exception as e:
-                    return {
-                        'error': str(e),
-                        'status': 'error'
-                    }, 400
-        
-        @ns.route('/predict/batch')
-        class BatchPredict(Resource):
-            @ns.expect(self.batch_prediction_model)
-            @ns.marshal_with(self.prediction_response_model, code=200)
-            @ns.marshal_with(self.error_response_model, code=400)
-            def post(self):
-                """Make predictions for multiple houses"""
-                try:
-                    data = request.get_json()
-                    houses = data.get('houses', [])
-                    
-                    all_predictions = []
-                    for house_data in houses:
-                        predictions = self.model_service.predict(house_data)
-                        all_predictions.extend(predictions.tolist())
-                    
-                    return {
-                        'predictions': all_predictions,
-                        'status': 'success',
-                        'count': len(all_predictions)
-                    }, 200
-                    
-                except Exception as e:
-                    return {
-                        'error': str(e),
-                        'status': 'error'
-                    }, 400
-        
-        # Health check endpoint
-        health_ns = self.api.namespace('health', description='Service health operations')
-        
-        @health_ns.route('/status')
-        class Health(Resource):
-            @health_ns.marshal_with(self.health_response_model)
-            def get(self):
-                """Check service health status"""
-                return {
-                    'status': 'healthy',
-                    'model_loaded': self.model_service.model is not None,
-                    'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-                }
-    
+        @self.app.post(
+            "/predict",
+            response_model=PredictionResponse,
+            responses={
+                200: {"description": "Successful prediction"},
+                400: {"model": ErrorResponse, "description": "Invalid input data"},
+                500: {"model": ErrorResponse, "description": "Internal server error"}
+            },
+            summary="Predict single house price",
+            description="Make a price prediction for a single house using all required features."
+        )
+        async def predict_house_price(house: HouseFeatures):
+            """
+            Predict the price of a single house.
+            
+            - **house**: Complete house information including all features
+            - **returns**: Predicted price with metadata
+            """
+            try:
+                # Convert to DataFrame
+                house_df = self._convert_house_to_dataframe(house)
+                
+                # Make prediction
+                predictions = self.model_service.predict(house_df)
+                
+                return PredictionResponse(
+                    predictions=predictions.tolist(),
+                    status="success",
+                    count=len(predictions),
+                    model_version=self.model_service.model_version,
+                    prediction_timestamp=datetime.now().isoformat()
+                )
+                
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+        @self.app.post(
+            "/predict/batch",
+            response_model=PredictionResponse,
+            responses={
+                200: {"description": "Successful batch predictions"},
+                400: {"model": ErrorResponse, "description": "Invalid input data"},
+                500: {"model": ErrorResponse, "description": "Internal server error"}
+            },
+            summary="Predict multiple house prices",
+            description="Make price predictions for multiple houses in a single request."
+        )
+        async def predict_batch_house_prices(batch_request: BatchPredictionRequest):
+            """
+            Predict prices for multiple houses in batch.
+            
+            - **batch_request**: List of houses with complete feature information
+            - **returns**: List of predicted prices with metadata
+            """
+            try:
+                if not batch_request.houses:
+                    raise HTTPException(status_code=400, detail="No houses provided for prediction")
+                
+                all_predictions = []
+                
+                for house in batch_request.houses:
+                    house_df = self._convert_house_to_dataframe(house)
+                    predictions = self.model_service.predict(house_df)
+                    all_predictions.extend(predictions.tolist())
+                
+                return PredictionResponse(
+                    predictions=all_predictions,
+                    status="success",
+                    count=len(all_predictions),
+                    model_version=self.model_service.model_version,
+                    prediction_timestamp=datetime.now().isoformat()
+                )
+                
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+        @self.app.get(
+            "/health",
+            response_model=HealthResponse,
+            summary="Service health check",
+            description="Check the health status and metadata of the prediction service."
+        )
+        async def health_check():
+            """
+            Get service health status and model information.
+            
+            - **returns**: Health status, model info, and service metrics
+            """
+            try:
+                import psutil
+                process = psutil.Process()
+                memory_mb = process.memory_info().rss / 1024 / 1024
+            except:
+                memory_mb = None
+            
+            return HealthResponse(
+                status="healthy",
+                model_loaded=self.model_service.model is not None,
+                model_path=self.model_service.model_path,
+                uptime_seconds=time.time() - self.start_time,
+                timestamp=datetime.now().isoformat(),
+                memory_usage_mb=memory_mb
+            )
+
+        @self.app.get(
+            "/model/info",
+            summary="Get model information",
+            description="Retrieve detailed information about the loaded model."
+        )
+        async def get_model_info():
+            """Get detailed model information and statistics."""
+            return {
+                **self.model_service.get_model_info(),
+                "service_uptime_seconds": time.time() - self.start_time,
+                "current_timestamp": datetime.now().isoformat()
+            }
+
+        @self.app.get(
+            "/",
+            summary="API root",
+            description="Root endpoint with API information."
+        )
+        async def root():
+            """Root endpoint with welcome message and API information."""
+            return {
+                "message": "🏠 House Price Prediction API",
+                "version": "2.0.0",
+                "docs_url": "/docs",
+                "redoc_url": "/redoc",
+                "health_check": "/health",
+                "model_info": "/model/info"
+            }
+
+    async def start_async(self):
+        """Start the FastAPI server asynchronously."""
+        config = uvicorn.Config(
+            app=self.app,
+            host="0.0.0.0",
+            port=self.port,
+            log_level="info",
+            access_log=True
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
     def start(self):
-        """Start the deployment service."""
+        """Start the FastAPI server in a separate thread."""
         def run_server():
-            self.app.run(host='0.0.0.0', port=self.port, debug=False, use_reloader=False)
+            uvicorn.run(
+                self.app,
+                host="0.0.0.0",
+                port=self.port,
+                log_level="info",
+                access_log=True
+            )
         
         self.server_thread = threading.Thread(target=run_server)
         self.server_thread.daemon = True
         self.server_thread.start()
         
-        # Wait a bit for server to start
-        time.sleep(2)
-        print(f"Model service started on http://localhost:{self.port}")
-        print(f"Swagger UI available at: http://localhost:{self.port}/swagger/")
-        print(f"API endpoints:")
-        print(f"  - POST /api/v1/predictions/predict")
-        print(f"  - POST /api/v1/predictions/predict/batch")
-        print(f"  - GET /api/v1/health/status")
-        
-    def stop(self):
-        """Stop the deployment service."""
-        print("Stopping model service...")
-        # Note: Flask development server doesn't have a clean shutdown method
-        # In production, you'd use a proper WSGI server like Gunicorn
+        # Wait for server to start
+        time.sleep(3)
+        print(f"🚀 FastAPI server started on http://localhost:{self.port}")
+        print(f"📚 Swagger UI available at: http://localhost:{self.port}/docs")
+        print(f"📖 ReDoc available at: http://localhost:{self.port}/redoc")
+        print(f"🏠 API endpoints:")
+        print(f"  - POST /predict : Single house prediction")
+        print(f"  - POST /predict/batch : Batch house predictions") 
+        print(f"  - GET /health : Health check")
+        print(f"  - GET /model/info : Model information")
 
 
 def continuous_deployment_pipeline():
-    """Run a training job and deploy a simple model deployment."""
+    """Run training and deploy FastAPI model service."""
     
-    print("Starting Continuous Deployment Pipeline...")
+    print("🔄 Starting Continuous Deployment Pipeline...")
     
     # Run the training pipeline
     trained_model, model_path = ml_pipeline()
     
-    # Deploy the trained model
-    print("Deploying model with Swagger documentation...")
-    deployment_service = SimpleDeploymentService(model_path, port=5000)
+    # Deploy the trained model with FastAPI
+    print("🚀 Deploying model with FastAPI and Swagger...")
+    deployment_service = FastAPIDeploymentService(model_path, port=8000)
     deployment_service.start()
     
     # Save deployment info
     deployment_info = {
         'model_path': model_path,
-        'service_port': 5000,
-        'service_url': 'http://localhost:5000',
-        'swagger_url': 'http://localhost:5000/swagger/',
-        'status': 'deployed'
+        'service_port': 8000,
+        'service_url': 'http://localhost:8000',
+        'swagger_url': 'http://localhost:8000/docs',
+        'redoc_url': 'http://localhost:8000/redoc',
+        'status': 'deployed',
+        'deployment_timestamp': datetime.now().isoformat()
     }
     
     deployment_path = "models/deployment_info.pkl"
     joblib.dump(deployment_info, deployment_path)
     
-    print("Model deployed successfully!")
-    print(f"Service available at: http://localhost:5000")
-    print(f"Swagger UI available at: http://localhost:5000/swagger/")
+    print("✅ Model deployed successfully!")
+    print(f"🌐 Service available at: http://localhost:8000")
+    print(f"📚 Swagger UI: http://localhost:8000/docs")
+    print(f"📖 ReDoc: http://localhost:8000/redoc")
     
     return deployment_service
 
 
 def inference_pipeline():
-    """Run a batch inference job with data loaded from an API."""
+    """Run batch inference pipeline."""
     
-    print("Starting Inference Pipeline...")
+    print("🔍 Starting Inference Pipeline...")
     
     # Load batch data for inference
-    print("Loading batch data...")
+    print("📊 Loading batch data...")
     batch_data = dynamic_importer()
 
     # Load the deployed model service info
@@ -240,93 +420,88 @@ def inference_pipeline():
         model_service = ModelService(model_path)
         
         # Run predictions on the batch data
-        print("Making predictions on batch data...")
+        print("🤖 Making predictions on batch data...")
         predictions = model_service.predict(batch_data)
         
-        print(f"Generated {len(predictions)} predictions")
-        print("Sample predictions:", predictions[:5])
+        print(f"✅ Generated {len(predictions)} predictions")
+        print("📈 Sample predictions:", predictions[:5])
         
-        # Save predictions
+        # Save predictions with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         predictions_df = pd.DataFrame({
-            'predictions': predictions
+            'predictions': predictions,
+            'prediction_timestamp': datetime.now().isoformat()
         })
-        predictions_df.to_csv("models/batch_predictions.csv", index=False)
-        print("Predictions saved to models/batch_predictions.csv")
+        
+        predictions_path = f"models/batch_predictions_{timestamp}.csv"
+        predictions_df.to_csv(predictions_path, index=False)
+        print(f"💾 Predictions saved to {predictions_path}")
         
         return predictions
         
     except FileNotFoundError:
-        print("No deployment info found. Please run continuous_deployment_pipeline first.")
+        print("❌ No deployment info found. Please run continuous_deployment_pipeline first.")
         return None
     except Exception as e:
-        print(f"Error during inference: {e}")
+        print(f"❌ Error during inference: {e}")
         return None
 
 
-def predict_single(data, model_path=None):
-    """Make a single prediction."""
+def create_example_request():
+    """Create example request data for testing."""
     
-    if model_path is None:
-        # Load latest model
-        try:
-            with open("models/latest_model_path.txt", 'r') as f:
-                model_path = f.read().strip()
-        except FileNotFoundError:
-            print("No trained model found. Please run the training pipeline first.")
-            return None
-    
-    model_service = ModelService(model_path)
-    prediction = model_service.predict(data)
-    
-    return prediction
-
-
-def create_test_client():
-    """Create a test client with example data."""
-    
-    # Example test data
-    test_data = {
-        'date':['2014-05-02'],
-        'bedrooms':[3],
-        'bathrooms':[2],
-        'sqft_living':[1180],
-        'sqft_lot':[5650],
-        'floors':[1],
-        'waterfront':[0],
-        'view':[0],
-        'condition':[3],
-        'sqft_above':[1180],
-        'sqft_basement':[0],
-        'yr_built':[2003],
-        'yr_renovated':[0],
-        'street':['Northwest 105th Street'],
-        'city':['Seattle'],
-        'statezip':['WA 98105'],
-        'country':['USA']
+    example_house = {
+        "date": "2014-05-02",
+        "bedrooms": 3,
+        "bathrooms": 2.0,
+        "sqft_living": 1180,
+        "sqft_lot": 5650,
+        "floors": 1.0,
+        "waterfront": 0,
+        "view": 0,
+        "condition": 3,
+        "sqft_above": 1180,
+        "sqft_basement": 0,
+        "yr_built": 2003,
+        "yr_renovated": 0,
+        "street": "Northwest 105th Street",
+        "city": "Seattle",
+        "statezip": "WA 98105",
+        "country": "USA"
     }
     
-    print("Example test data:")
-    print("POST /api/v1/predictions/predict")
+    print("📋 Example API request:")
+    print("POST http://localhost:8000/predict")
     print("Content-Type: application/json")
     print()
-    print("Request body:")
-    import json
-    print(json.dumps(test_data, indent=2))
     
-    return test_data
+    import json
+    print("Request body:")
+    print(json.dumps(example_house, indent=2))
+    
+    print("\n📋 Example batch request:")
+    batch_example = {
+        "houses": [example_house]
+    }
+    print("POST http://localhost:8000/predict/batch")
+    print("Request body:")
+    print(json.dumps(batch_example, indent=2))
+    
+    return example_house
 
 
 if __name__ == "__main__":
-    # Example usage
+    # Run the continuous deployment pipeline
     service = continuous_deployment_pipeline()
     
-    # Print test data example
-    create_test_client()
+    # Print example requests
+    create_example_request()
     
     # Keep the service running
     try:
+        print("\n🔄 Service is running... Press Ctrl+C to stop")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\nShutting down...")
-        service.stop()
+        print("\n🛑 Shutting down...")
+        print("✅ Service stopped!")

@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-07-23T03:29:24.627391",
+  "model_path": "models\\prices_predictor_20250723_032924.pkl",
+  "key_metrics": {
+    "r2_score": "0.4426",
+    "custom_accuracy": "97.83%",
+    "accuracy_within_10_percent": "99.76%",
+    "mape": "0.0217",
+    "mae": "$0.28",
+    "rmse": "$0.38"
+  }
+}
