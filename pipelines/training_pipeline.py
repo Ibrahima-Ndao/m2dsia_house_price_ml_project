@@ -118,7 +118,7 @@ def ml_pipeline():
     # Data Ingestion Step
     print("📥 Step 1: Data Ingestion")
     raw_data = data_ingestion_step(
-        file_path="D:/Data science/MLOPS/price_house_project/house-price-project/data/archive.zip"
+        file_path="./data/archive.zip"
     )
     print(f"   ✅ Loaded {len(raw_data)} records")
 

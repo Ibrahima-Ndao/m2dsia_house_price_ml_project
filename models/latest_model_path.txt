@@ -1,0 +1,1 @@
+models\prices_predictor_20250724_174052.pkl
