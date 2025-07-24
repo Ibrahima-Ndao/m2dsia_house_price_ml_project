@@ -1,1 +1,1 @@
-models\prices_predictor_20250723_032924.pkl
+models\prices_predictor_20250724_140956.pkl
