@@ -42,13 +42,9 @@ def display_model_performance():
         acc_interp = "Excellent" if acc >= 80 else "Good" if acc >= 60 else "Fair" if acc >= 40 else "Poor" 
         table.add_row("Custom Accuracy", metrics['custom_accuracy'], acc_interp)
         
-        within_10 = float(metrics['accuracy_within_10_percent'].rstrip('%'))
-        within_interp = "High Precision" if within_10 >= 70 else "Moderate" if within_10 >= 50 else "Low Precision"
-        table.add_row("Accuracy ±10%", metrics['accuracy_within_10_percent'], within_interp)
+                  
         
-        table.add_row("MAPE", metrics['mape'], "Lower is better")
-        table.add_row("MAE", metrics['mae'], "Average error")
-        table.add_row("RMSE", metrics['rmse'], "Root mean squared error")
+        table.add_row("MSE", metrics['rmse'], "mean squared error")
         
         console.print(table)
         console.print(f"📅 Model trained: {performance['timestamp']}")

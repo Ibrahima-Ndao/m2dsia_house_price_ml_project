@@ -42,8 +42,11 @@ def calculate_accuracy_metrics(y_true, y_pred, tolerance_percent=10):
     # Mean Absolute Error
     mae = mean_absolute_error(y_true, y_pred)
     
+    # Mean Squared Error
+    mse = np.mean((y_true - y_pred) ** 2)
+    
     # Root Mean Square Error
-    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    rmse = np.mean((y_true - y_pred) ** 2)
     
     # Normalized RMSE (NRMSE) - normalized by the range of actual values
     nrmse = rmse / (np.max(y_true) - np.min(y_true))
@@ -58,6 +61,7 @@ def calculate_accuracy_metrics(y_true, y_pred, tolerance_percent=10):
         'r2_score': r2,
         'adjusted_r2': adjusted_r2,
         'mae': mae,
+        'mse':mse,
         'rmse': rmse,
         'nrmse': nrmse,
         'custom_accuracy': custom_accuracy
@@ -80,9 +84,10 @@ def print_detailed_metrics(metrics_dict, mse):
     print("\n📈 ERROR METRICS:")
     print(f"   • Mean Absolute Percentage Error (MAPE): {metrics_dict['mape']:.4f}")
     print(f"   • Mean Absolute Error (MAE): ${metrics_dict['mae']:,.2f}")
+    print(f"   • Mean Square Error (MSE): ${metrics_dict['mse']:,.2f}")
     print(f"   • Root Mean Square Error (RMSE): ${metrics_dict['rmse']:,.2f}")
     print(f"   • Normalized RMSE (NRMSE): {metrics_dict['nrmse']:.4f}")
-    print(f"   • Mean Squared Error (MSE): ${mse:,.2f}")
+    
     
     print("\n🎪 PERFORMANCE INTERPRETATION:")
     if metrics_dict['r2_score'] >= 0.8:
